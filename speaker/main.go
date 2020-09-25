@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -78,6 +79,7 @@ func main() {
 		mlLabels    = flag.String("ml-labels", os.Getenv("METALLB_ML_LABELS"), "Labels to match the speakers (for MemberList / fast dead node detection)")
 		mlNamespace = flag.String("ml-namespace", os.Getenv("METALLB_ML_NAMESPACE"), "Namespace of the speakers (for MemberList / fast dead node detection)")
 		mlSecret    = flag.String("ml-secret-key", os.Getenv("METALLB_ML_SECRET_KEY"), "Secret key for MemberList (fast dead node detection)")
+		mlPeers     = flag.String("ml-peers", os.Getenv("METALLB_ML_PEERS"), "Manual comma separated list of peers for MemberList (fast dead node detection). Useful when running out-of-cluster on static nodes.")
 		myNode      = flag.String("node-name", os.Getenv("METALLB_NODE_NAME"), "name of this Kubernetes node (spec.nodeName)")
 		port        = flag.Int("port", 80, "HTTP listening port")
 	)
@@ -103,9 +105,11 @@ func main() {
 
 	var mlist *memberlist.Memberlist
 	var eventCh chan memberlist.NodeEvent
-	if *mlNamespace == "" || *mlLabels == "" || *mlBindAddr == "" {
-		logger.Log("op", "startup", "msg", "Not starting fast dead node detection (MemberList), need ml-bindaddr / ml-labels / ml-namespace config")
+	var useMLPeers bool
+	if !doMLConfig(*mlNamespace, *mlLabels, *mlBindAddr, *mlPeers) {
+		logger.Log("op", "startup", "msg", "Not starting fast dead node detection (MemberList), need ml-bindaddr / ml-labels / ml-namespace / ml-peers config")
 	} else {
+		useMLPeers = *mlPeers != ""
 		mconfig := memberlist.DefaultLANConfig()
 		// mconfig.Name MUST be spec.nodeName, as we will match it against Enpoints nodeName in usableNodes()
 		mconfig.Name = *myNode
@@ -136,9 +140,10 @@ func main() {
 
 	// Setup all clients and speakers, config decides what is being done runtime.
 	ctrl, err := newController(controllerConfig{
-		MyNode: *myNode,
-		Logger: logger,
-		MList:  mlist,
+		MyNode:       *myNode,
+		Logger:       logger,
+		MList:        mlist,
+		OutOfCluster: useMLPeers,
 	})
 	if err != nil {
 		logger.Log("op", "startup", "error", err, "msg", "failed to create MetalLB controller")
@@ -170,7 +175,13 @@ func main() {
 	if mlist != nil {
 		go watchMemberListEvents(logger, eventCh, stopCh, client)
 
-		iplist, err := client.GetPodsIPs(*mlNamespace, *mlLabels)
+		iplist, err := func() ([]string, error) {
+			if useMLPeers {
+				logger.Log("op", "startup", "msg", "using configured mlPeers", "peers", *mlPeers)
+				return strings.Split(*mlPeers, ","), nil
+			}
+			return client.GetPodsIPs(*mlNamespace, *mlLabels)
+		}()
 		if err != nil {
 			logger.Log("op", "startup", "error", err, "msg", "failed to get PodsIPs")
 			os.Exit(1)
@@ -224,6 +235,8 @@ type controllerConfig struct {
 	Logger gokitlog.Logger
 	MList  *memberlist.Memberlist
 
+	OutOfCluster bool
+
 	// For testing only, and will be removed in a future release.
 	// See: https://github.com/google/metallb/issues/152.
 	DisableLayer2 bool
@@ -244,9 +257,10 @@ func newController(cfg controllerConfig) (*controller, error) {
 			return nil, fmt.Errorf("making layer2 announcer: %s", err)
 		}
 		protocols[config.Layer2] = &layer2Controller{
-			announcer: a,
-			myNode:    cfg.MyNode,
-			mList:     cfg.MList,
+			announcer:    a,
+			myNode:       cfg.MyNode,
+			mList:        cfg.MList,
+			outOfCluster: cfg.OutOfCluster,
 		}
 	}
 
@@ -322,6 +336,7 @@ func (c *controller) SetBalancer(l gokitlog.Logger, name string, svc *v1.Service
 	}
 
 	if deleteReason := handler.ShouldAnnounce(l, name, svc, eps); deleteReason != "" {
+		l.Log("op", "setBalancer", "msg", "not announcing", "reason", deleteReason)
 		return c.deleteBalancer(l, name, deleteReason)
 	}
 
@@ -419,6 +434,16 @@ func (c *controller) SetNode(l gokitlog.Logger, node *v1.Node) k8s.SyncState {
 		}
 	}
 	return k8s.SyncStateSuccess
+}
+
+func doMLConfig(mlNamespace, mlLabels, mlBindAddr, mlPeers string) bool {
+	if mlBindAddr == "" {
+		return false
+	}
+	if mlPeers != "" {
+		return true
+	}
+	return mlNamespace != "" && mlLabels != ""
 }
 
 // A Protocol can advertise an IP address.

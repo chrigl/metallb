@@ -19,18 +19,20 @@ import (
 	"crypto/sha256"
 	"net"
 	"sort"
+	"strings"
 
 	"github.com/go-kit/kit/log"
 	"github.com/hashicorp/memberlist"
 	"go.universe.tf/metallb/internal/config"
 	"go.universe.tf/metallb/internal/layer2"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 )
 
 type layer2Controller struct {
-	announcer *layer2.Announce
-	myNode    string
-	mList     *memberlist.Memberlist
+	announcer    *layer2.Announce
+	myNode       string
+	mList        *memberlist.Memberlist
+	outOfCluster bool
 }
 
 func (c *layer2Controller) SetConfig(log.Logger, *config.Config) error {
@@ -76,7 +78,15 @@ func usableNodes(eps *v1.Endpoints, mList *memberlist.Memberlist) []string {
 }
 
 func (c *layer2Controller) ShouldAnnounce(l log.Logger, name string, svc *v1.Service, eps *v1.Endpoints) string {
-	nodes := usableNodes(eps, c.mList)
+	var nodes []string
+	if c.outOfCluster && c.mList != nil {
+		for _, n := range c.mList.Members() {
+			nodes = append(nodes, n.Name)
+		}
+		l.Log("op", "ShouldAnnounce", "component", "l2", "msg", "using out of cluster configuration", "nodes", strings.Join(nodes, ","))
+	} else {
+		nodes = usableNodes(eps, c.mList)
+	}
 	// Sort the slice by the hash of node + service name. This
 	// produces an ordering of ready nodes that is unique to this
 	// service.
